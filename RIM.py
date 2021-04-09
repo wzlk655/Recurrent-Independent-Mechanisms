@@ -170,62 +170,62 @@ class RIMCell(nn.Module):
 	    Output: inputs (list of size num_units with each element of shape (batch_size, input_value_size))
 	    		mask_ binary array of shape (batch_size, num_units) where 1 indicates active and 0 indicates inactive
 		"""
-	    key_layer = self.key(x)
-	    value_layer = self.value(x)
-	    query_layer = self.query(h)
+	    key_layer = self.key(x)  # (batch_size, 2, num_input_heads * input_query_size)
+	    value_layer = self.value(x)  # (batch_size, 2, num_input_heads * input_value_size)
+	    query_layer = self.query(h)  # (batch_size, num_units, num_input_heads * input_key_size)
+		# 注意这不是self-attention了，而是模块的h到输入的x的attention
+	    key_layer = self.transpose_for_scores(key_layer,  self.num_input_heads, self.input_key_size)  # (batch_size, num_input_heads, 2, input_key_size)
+	    value_layer = torch.mean(self.transpose_for_scores(value_layer,  self.num_input_heads, self.input_value_size), dim = 1)  # (batch_size, 2, input_value_size)
+	    query_layer = self.transpose_for_scores(query_layer, self.num_input_heads, self.input_query_size)  # (batch_size, num_input_heads, num_units, input_query_size)
 
-	    key_layer = self.transpose_for_scores(key_layer,  self.num_input_heads, self.input_key_size)
-	    value_layer = torch.mean(self.transpose_for_scores(value_layer,  self.num_input_heads, self.input_value_size), dim = 1)
-	    query_layer = self.transpose_for_scores(query_layer, self.num_input_heads, self.input_query_size)
+	    attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) / math.sqrt(self.input_key_size)  # (batch_size, num_input_heads, num_units, 2)
+	    attention_scores = torch.mean(attention_scores, dim = 1)  # (batch_size, num_units, 2)
+	    mask_ = torch.zeros(x.size(0), self.num_units).to(self.device)  # (batch_size, num_units)
 
-	    attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) / math.sqrt(self.input_key_size) 
-	    attention_scores = torch.mean(attention_scores, dim = 1)
-	    mask_ = torch.zeros(x.size(0), self.num_units).to(self.device)
-
-	    not_null_scores = attention_scores[:,:, 0]
-	    topk1 = torch.topk(not_null_scores,self.k,  dim = 1)
+	    not_null_scores = attention_scores[:,:, 0]  # (batch_size, num_units)选择attention在有意义输入（而非null）
+	    topk1 = torch.topk(not_null_scores, self.k, dim = 1)  # ((batch_size, self.k),(batch_size, self.k))
 	    row_index = np.arange(x.size(0))
-	    row_index = np.repeat(row_index, self.k)
+	    row_index = np.repeat(row_index, self.k)  # (batch_size*self.k)
 
-	    mask_[row_index, topk1.indices.view(-1)] = 1
+	    mask_[row_index, topk1.indices.view(-1)] = 1  # 这里row_index和topk1.indices.view代表的column index结合指示出了mask_中为1的坐标！！！
 	    
-	    attention_probs = self.input_dropout(nn.Softmax(dim = -1)(attention_scores))
-	    inputs = torch.matmul(attention_probs, value_layer) * mask_.unsqueeze(2)
+	    attention_probs = self.input_dropout(nn.Softmax(dim = -1)(attention_scores))  # (batch_size, num_units, 2)
+	    inputs = torch.matmul(attention_probs, value_layer) * mask_.unsqueeze(2)  # (batch_size, num_units, input_value_size), (batch_size, num_units)
 
 	    return inputs, mask_
 
 	def communication_attention(self, h, mask):
 	    """
 	    Input : h (batch_size, num_units, hidden_size)
-	    	    mask obtained from the input_attention_mask() function
+	    	    mask obtained from the input_attention_mask() function 注： mask应该是 (batch_size, num_units)
 	    Output: context_layer (batch_size, num_units, hidden_size). New hidden states after communication
 	    """
 	    query_layer = []
 	    key_layer = []
 	    value_layer = []
 	    
-	    query_layer = self.query_(h)
-	    key_layer = self.key_(h)
-	    value_layer = self.value_(h)
+	    query_layer = self.query_(h)  # (batch_size, num_units, num_comm_heads * comm_query_size)
+	    key_layer = self.key_(h)  # (batch_size, num_units, num_comm_heads * comm_key_size)
+	    value_layer = self.value_(h)  # (batch_size, num_units, num_comm_heads * comm_value_size)
 
-	    query_layer = self.transpose_for_scores(query_layer, self.num_comm_heads, self.comm_query_size)
-	    key_layer = self.transpose_for_scores(key_layer, self.num_comm_heads, self.comm_key_size)
-	    value_layer = self.transpose_for_scores(value_layer, self.num_comm_heads, self.comm_value_size)
-	    attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+	    query_layer = self.transpose_for_scores(query_layer, self.num_comm_heads, self.comm_query_size)  # (batch_size, num_comm_heads, num_units, comm_query_size)
+	    key_layer = self.transpose_for_scores(key_layer, self.num_comm_heads, self.comm_key_size)  # (batch_size, num_comm_heads, num_units, comm_key_size)
+	    value_layer = self.transpose_for_scores(value_layer, self.num_comm_heads, self.comm_value_size)  # (batch_size, num_comm_heads, num_units, comm_value_size)
+	    attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))  # (batch_size, num_comm_heads, num_units, num_units)
 	    attention_scores = attention_scores / math.sqrt(self.comm_key_size)
 	    
-	    attention_probs = nn.Softmax(dim=-1)(attention_scores)
+	    attention_probs = nn.Softmax(dim=-1)(attention_scores)  # (batch_size, num_comm_heads, num_units, num_units)
 	    
 	    mask = [mask for _ in range(attention_probs.size(1))]
-	    mask = torch.stack(mask, dim = 1)
+	    mask = torch.stack(mask, dim = 1)  # (batch_size, num_comm_heads, num_units)
 	    
-	    attention_probs = attention_probs * mask.unsqueeze(3)
+	    attention_probs = attention_probs * mask.unsqueeze(3)  # 只关心activate的unit对其它unit的attention
 	    attention_probs = self.comm_dropout(attention_probs)
-	    context_layer = torch.matmul(attention_probs, value_layer)
-	    context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+	    context_layer = torch.matmul(attention_probs, value_layer)  # (batch_size, num_comm_heads, num_units, comm_value_size)
+	    context_layer = context_layer.permute(0, 2, 1, 3).contiguous()  # (batch_size, num_units, num_comm_heads, comm_value_size)
 	    new_context_layer_shape = context_layer.size()[:-2] + (self.num_comm_heads * self.comm_value_size,)
-	    context_layer = context_layer.view(*new_context_layer_shape)
-	    context_layer = self.comm_attention_output(context_layer)
+	    context_layer = context_layer.view(*new_context_layer_shape)  # (batch_size, num_units, num_comm_heads*comm_value_size)
+	    context_layer = self.comm_attention_output(context_layer)  # (batch_size, num_units, comm_value_size) 不再是简单的mean了
 	    context_layer = context_layer + h
 	    
 	    return context_layer
@@ -243,7 +243,7 @@ class RIMCell(nn.Module):
 		x = torch.cat((x, null_input), dim = 1)
 
 		# Compute input attention
-		inputs, mask = self.input_attention_mask(x, hs)
+		inputs, mask = self.input_attention_mask(x, hs)  # (batch_size, num_units, input_value_size), (batch_size, num_units)
 		h_old = hs * 1.0
 		if cs is not None:
 			c_old = cs * 1.0
@@ -257,13 +257,13 @@ class RIMCell(nn.Module):
 			hs = self.rnn(inputs, hs)
 
 		# Block gradient through inactive units
-		mask = mask.unsqueeze(2)
-		h_new = blocked_grad.apply(hs, mask)
+		mask = mask.unsqueeze(2)  # (batch_size, num_units, 1)
+		h_new = blocked_grad.apply(hs, mask)  # 定义了一个不改变前向传播，只mask反向梯度的torch算子
 
 		# Compute communication attention
 		h_new = self.communication_attention(h_new, mask.squeeze(2))
 
-		hs = mask * h_new + (1 - mask) * h_old
+		hs = mask * h_new + (1 - mask) * h_old  # 非激活模块不更新状态
 		if cs is not None:
 			cs = mask * cs + (1 - mask) * c_old
 			return hs, cs

@@ -148,7 +148,7 @@ class RIMCell(nn.Module):
 			self.rnn = GroupGRUCell(input_value_size, hidden_size, num_units)
 			self.query = GroupLinearLayer(hidden_size,  input_key_size * num_input_heads, self.num_units)
 		else:
-			self.rnn = GroupLSTMCell(input_value_size, hidden_size, num_uni
+			self.rnn = GroupLSTMCell(input_value_size, hidden_size, num_units)
 			self.query = GroupLinearLayer(hidden_size,  input_key_size * num_input_heads, self.num_units)
 		self.query_ =GroupLinearLayer(hidden_size, comm_query_size * num_comm_heads, self.num_units) 
 		self.key_ = GroupLinearLayer(hidden_size, comm_key_size * num_comm_heads, self.num_units)

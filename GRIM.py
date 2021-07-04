@@ -122,7 +122,8 @@ class RIMCell_global_working_space(nn.Module):
     '''
     def __init__(self, 
         device, input_size, hidden_size, num_units, k, rnn_cell, input_key_size = 64, input_value_size = 400, input_query_size = 64,
-        num_input_heads = 1, input_dropout = 0.1):
+        num_input_heads = 1, input_dropout = 0.1, num_mem_slots=4, write_attention_heads=1, key_size=32,
+              mem_attention_heads=4, mem_attention_key=32, write_dropout=0.1, read_dropout=0.1, num_mlp_layers=1):
         super().__init__()
         self.device = device
         self.hidden_size = hidden_size
@@ -130,6 +131,7 @@ class RIMCell_global_working_space(nn.Module):
         self.rnn_cell = rnn_cell
         self.key_size = input_key_size
         self.k = k
+        self.num_mem_slots = num_mem_slots
         self.num_input_heads = num_input_heads
         self.input_key_size = input_key_size
         self.input_query_size = input_query_size
@@ -146,7 +148,8 @@ class RIMCell_global_working_space(nn.Module):
             self.query = GroupLinearLayer(hidden_size,  input_key_size * num_input_heads, self.num_units)
         self.input_dropout = nn.Dropout(p =input_dropout)
 
-        self.global_working_space = Global_working_space(self.hidden_size, self.hidden_size)
+        self.global_working_space = Global_working_space(self.hidden_size, self.hidden_size, self.num_mem_slots, write_attention_heads, key_size,
+              mem_attention_heads, mem_attention_key, write_dropout, read_dropout, num_mlp_layers)
 
 
     def transpose_for_scores(self, x, num_attention_heads, attention_head_size):
@@ -222,8 +225,13 @@ class RIMCell_global_working_space(nn.Module):
             cs = mask * cs + (1 - mask) * c_old
 
         # Compute communication attention
-        mem_new = self.global_working_space.write(hs[mask.squeeze(2).bool()].view(-1,self.k,self.hidden_size), mem)
-        hs = self.global_working_space.read(hs, mem_new)
+        hs_, mem_new = self.global_working_space(hs[mask.squeeze(2).bool()].view(-1,self.k,self.hidden_size),mem)
+        # TODO：为了让选择可导，只能出此下策
+        # hs[mask.squeeze(2).bool()] = hs[mask.squeeze(2).bool()]-hs[mask.squeeze(2).bool()].data.clone().detach()+hs_.view(-1, self.hidden_size)
+        hs = hs.clone().detach()
+        hs[mask.squeeze(2).bool()] = hs_.view(-1, self.hidden_size)
+        # mem_new = self.global_working_space.write(hs[mask.squeeze(2).bool()].view(-1,self.k,self.hidden_size), mem)
+        # hs = self.global_working_space.read(hs, mem_new)
 
         return hs, mem_new, cs
 
@@ -244,6 +252,7 @@ class Global_working_space(nn.Module):
         self.write_attention_heads = write_attention_heads
         self.key_size = key_size
         self.num_mlp_layers = num_mlp_layers
+        assert self.write_input_size==self.num_mem_size, "目前的模型为了之后计算attention时concat，规定这二者要相等"
 
         self.write_query = nn.Linear(
             self.num_mem_size, self.write_attention_heads*self.key_size)
@@ -253,9 +262,15 @@ class Global_working_space(nn.Module):
         self.write_value = nn.Linear(self.write_input_size, self.write_attention_heads*self.num_mem_size)
         self.write_output = nn.Linear(self.num_mem_size*self.write_attention_heads, self.num_mem_size)
         self.write_dropout_layer = nn.Dropout(p=write_dropout)
+        self.write_attention_mlp = nn.Sequential(
+            *[nn.Linear(self.num_mem_size, self.num_mem_size) for _ in range(self.num_mlp_layers)],
+            nn.LayerNorm((self.num_mem_slots, self.num_mem_size, self.num_mem_size)),
+            nn.ReLU()
+        )
 
+        # 这里直接默认gating_style是units，即对每个memory slot生成单独的gate，如果style是memory的话，输出维度是1，应用到整个memory上
         self.update_trans = nn.Linear(self.write_input_size, self.num_mem_size)
-        self.update_input = nn.Linear(self.num_mem_size, self.)
+        self.update_gating = nn.Linear(self.num_mem_size, self.num_mem_size*2)
 
         self.mem_attention_heads = mem_attention_heads
         self.mem_attention_key = mem_attention_key
@@ -278,24 +293,37 @@ class Global_working_space(nn.Module):
     def write(self, write_inputs, memory):
         '''
         write_inputs:[batch_size, num_units?, hidden_size]
-        memory:[batch_size, num_mem_slots, num_mem_heads]
+        memory:[batch_size, num_mem_slots, num_mem_size]
         '''
+        write_inputs = torch.cat([write_inputs, memory],dim=1)  # 理论上inputs和memory的最后一维形状未必一样，但是文章中这么规定了。。。。。。
         query_write = self.write_query(memory)  # [batch_size, num_mem_slots, size_attention_head*key_size]
-        key_write = self.write_key(write_inputs) # [batch_size, num_units?, size_attention_head*key_size]
-        value_write = self.write_value(write_inputs) # [batch_size, num_units?, size_attention_head*num_mem_heads]
+        key_write = self.write_key(write_inputs) # [batch_size, num_units?+num_mem_slots, size_attention_head*key_size]
+        value_write = self.write_value(write_inputs) # [batch_size, num_units?+num_mem_slots, size_attention_head*num_mem_size]
 
         query_write = self.transpose_for_scores(query_write, self.write_attention_heads, self.key_size)  # (batch_size, size_attention_head, num_mem_slots, key_size)
         key_write = self.transpose_for_scores(key_write, self.write_attention_heads, self.key_size)  # (batch_size, size_attention_head, num_units, key_size)
-        value_write = self.transpose_for_scores(value_write, self.write_attention_heads, self.num_mem_size)  # (batch_size, size_attention_head, num_units, num_mem_heads)
+        value_write = self.transpose_for_scores(value_write, self.write_attention_heads, self.num_mem_size)  # (batch_size, size_attention_head, num_units, num_mem_size)
         attention_scores = torch.matmul(query_write, key_write.transpose(-1, -2))  # (batch_size, size_attention_head, num_mem_slots, num_units)
         attention_scores = attention_scores / math.sqrt(self.key_size)
 
         attention_probs = self.write_dropout_layer(nn.Softmax(dim=-1)(attention_scores))  # (batch_size, size_attention_head, num_mem_slots, num_units)
 
-        memory_new = torch.matmul(attention_probs, value_write)  # (batch_size, size_attention_head, num_mem_slots, num_mem_heads)
+        memory_new = torch.matmul(attention_probs, value_write)  # (batch_size, size_attention_head, num_mem_slots, num_mem_size)
         memory_new = self.write_output(memory_new.transpose(-2,-3).view((-1,self.num_mem_slots,self.write_attention_heads*self.num_mem_size)))
 
         return memory_new
+
+    def update(self, gating_inputs, gating_memory, new_memory):
+        '''
+        gating_inputs: [B, Ns, hidden_size]
+        gating_memory: [B, num_mem_slots, num_mem_size]
+        '''
+        inputs_mean = torch.relu(self.update_trans(gating_inputs)).mean(dim=1,keepdim=True)  # [B, 1, num_mem_size]
+        k = inputs_mean+torch.tanh(gating_memory)
+        gates = torch.sigmoid(self.update_gating(k))
+        input_gate, forget_gate = torch.split(gates, self.num_mem_size, dim=-1)
+        new_memory = input_gate*torch.tanh(new_memory)+forget_gate*gating_memory
+        return new_memory
 
     def read(self, read_heads, memory):
         query_read = self.read_query(read_heads)
@@ -316,9 +344,15 @@ class Global_working_space(nn.Module):
 
         return read_heads+read_heads_new
 
+    def forward(self, h_s, mem):
+        mem_new = self.write(h_s, mem)
+        mem_new = self.update(h_s, mem, mem_new)
+        h_s = self.read(h_s, mem_new)
+        return h_s, mem_new
 
-class RIM(nn.Module):
-    def __init__(self, device, input_size, hidden_size, num_units, k, rnn_cell, n_layers, bidirectional, **kwargs):
+
+class GRIM(nn.Module):
+    def __init__(self, device, input_size, hidden_size, num_units, k, num_mem_slots, rnn_cell, n_layers, bidirectional, **kwargs):
         super().__init__()
         if device == 'cuda':
             self.device = torch.device('cuda')
@@ -330,11 +364,11 @@ class RIM(nn.Module):
         self.num_units = num_units
         self.hidden_size = hidden_size
         if self.num_directions == 2:
-            self.rimcell = nn.ModuleList([RIMCell(self.device, input_size, hidden_size, num_units, k, rnn_cell, **kwargs).to(self.device) if i < 2 else 
-                RIMCell(self.device, 2 * hidden_size * self.num_units, hidden_size, num_units, k, rnn_cell, **kwargs).to(self.device) for i in range(self.n_layers * self.num_directions)])
+            self.rimcell = nn.ModuleList([RIMCell_global_working_space(self.device, input_size, hidden_size, num_units, k, rnn_cell, **kwargs).to(self.device) if i < 2 else 
+                RIMCell_global_working_space(self.device, 2 * hidden_size * self.num_units, hidden_size, num_units, k, rnn_cell, **kwargs).to(self.device) for i in range(self.n_layers * self.num_directions)])
         else:
-            self.rimcell = nn.ModuleList([RIMCell(self.device, input_size, hidden_size, num_units, k, rnn_cell, **kwargs).to(self.device) if i == 0 else
-            RIMCell(self.device, hidden_size * self.num_units, hidden_size, num_units, k, rnn_cell, **kwargs).to(self.device) for i in range(self.n_layers)])
+            self.rimcell = nn.ModuleList([RIMCell_global_working_space(self.device, input_size, hidden_size, num_units, k, rnn_cell, **kwargs).to(self.device) if i == 0 else
+            RIMCell_global_working_space(self.device, hidden_size * self.num_units, hidden_size, num_units, k, rnn_cell, **kwargs).to(self.device) for i in range(self.n_layers)])
 
     def layer(self, rim_layer, x, h, c = None, direction = 0):
         batch_size = x.size(1)

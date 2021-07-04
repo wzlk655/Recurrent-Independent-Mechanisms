@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from RIM import RIMCell
+from GRIM import RIMCell_global_working_space
 import numpy as np
 
 class MnistModel(nn.Module):
@@ -55,6 +56,62 @@ class MnistModel(nn.Module):
 		        total_norm += param_norm.item() ** 2
 	    total_norm = total_norm ** (1. / 2)
 	    return total_norm
+
+
+class MnistModel_global_working_space(nn.Module):
+	def __init__(self, args):
+		super().__init__()
+		self.args = args
+		if args['cuda']:
+			self.device = torch.device('cuda')
+		else:
+			self.device = torch.device('cpu')
+		self.rim_model = RIMCell_global_working_space(self.device, args['input_size'], args['hidden_size'], args['num_units'], args['k'], args['rnn_cell'], args['key_size_input'], args['value_size_input'] , args['query_size_input'],
+			args['num_input_heads'], args['input_dropout'], args['num_mem_slots'], write_attention_heads=1, key_size=32,
+              mem_attention_heads=4, mem_attention_key=32, write_dropout=0.1, read_dropout=0.1, num_mlp_layers=1).to(self.device)
+
+		self.Linear = nn.Linear(args['hidden_size'] * args['num_units'], 10)
+		self.Loss = nn.CrossEntropyLoss()
+
+	def to_device(self, x):
+		return torch.from_numpy(x).to(self.device)
+
+	def forward(self, x, y = None):
+		x = x.float()
+		
+		# initialize hidden states
+		hs = torch.randn(x.size(0), self.args['num_units'], self.args['hidden_size']).to(self.device)
+		mem = torch.randn(x.size(0), self.args['num_mem_slots'], self.args['hidden_size']).to(self.device)
+		cs = None
+		if self.args['rnn_cell'] == 'LSTM':
+			cs = torch.randn(x.size(0), self.args['num_units'], self.args['hidden_size']).to(self.device)
+
+		xs = torch.split(x, 1, 1)
+
+		# pass through RIMCell for all timesteps
+		for x in xs:
+			hs, mem, cs = self.rim_model(x, mem, hs, cs)
+		preds = self.Linear(hs.contiguous().view(x.size(0), -1))
+
+		if y is not None:
+			# Compute Loss
+			y = y.long()
+			probs = nn.Softmax(dim = -1)(preds)
+			entropy = torch.mean(torch.sum(probs*torch.log(probs), dim = 1))
+			loss = self.Loss(preds, y) - entropy
+			return probs, loss
+		return preds
+
+
+	def grad_norm(self):
+	    total_norm = 0
+	    for p in self.parameters():
+	    	if p.grad is not None:
+		        param_norm = p.grad.data.norm(2)
+		        total_norm += param_norm.item() ** 2
+	    total_norm = total_norm ** (1. / 2)
+	    return total_norm
+
 
 class LSTM(nn.Module):
 	def __init__(self, args):

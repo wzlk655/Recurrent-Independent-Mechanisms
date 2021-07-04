@@ -1,6 +1,6 @@
 import torch
 from data import MnistData
-from networks import MnistModel, LSTM
+from networks import MnistModel, LSTM, MnistModel_global_working_space
 from tqdm import tqdm
 import pickle
 import argparse
@@ -22,7 +22,7 @@ parser.add_argument('--epochs', type = int, default = 200)
 parser.add_argument('--batch_size', type = int, default = 64)
 parser.add_argument('--hidden_size', type = int, default = 100)
 parser.add_argument('--input_size', type = int, default = 1)
-parser.add_argument('--model', type = str, default = 'LSTM')
+parser.add_argument('--model', type = str, default = 'GRIM')
 parser.add_argument('--train', type = str2bool, default = True)
 parser.add_argument('--num_units', type = int, default = 6)
 parser.add_argument('--rnn_cell', type = str, default = 'LSTM')
@@ -39,9 +39,12 @@ parser.add_argument('--value_size_comm', type = int, default = 100)
 parser.add_argument('--query_size_comm', type = int, default = 32)
 parser.add_argument('--k', type = int, default = 4)
 
+parser.add_argument('--num_mem_slots', type = int, default = 4)
+# TODO:补充其他参数
+
 parser.add_argument('--size', type = int, default = 14)
 parser.add_argument('--loadsaved', type = int, default = 0)
-parser.add_argument('--log_dir', type = str, default = 'smnist_lstm_600')
+parser.add_argument('--log_dir', type = str, default = 'grim')
 
 args = vars(parser.parse_args())
 
@@ -52,6 +55,8 @@ torch.cuda.manual_seed(10)
 
 if args['model'] == 'LSTM':
 	mode = LSTM
+elif args['model'] == 'GRIM':
+	mode = MnistModel_global_working_space
 else:
 	mode = MnistModel
 
